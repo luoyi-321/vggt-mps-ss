@@ -58,3 +58,10 @@ results/
 *.glb
 *.ply
 *.obj
+
+# Large files and datasets
+add-doc/
+co3d-main/
+co3d-main.zip
+*.zip
+*.pdf
