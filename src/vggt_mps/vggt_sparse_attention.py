@@ -28,10 +28,22 @@ class SparseAttentionAggregator(nn.Module):
     No retraining needed - uses existing weights!
     """
 
-    def __init__(self, original_aggregator: nn.Module, megaloc: MegaLocMPS):
+    def __init__(
+        self,
+        original_aggregator: nn.Module,
+        megaloc: MegaLocMPS,
+        k_nearest: int = 10,
+        threshold: float = 0.7,
+        soft_mask: bool = False,
+        temperature: float = 0.1
+    ):
         super().__init__()
         self.aggregator = original_aggregator
         self.megaloc = megaloc
+        self.k_nearest = k_nearest
+        self.threshold = threshold
+        self.soft_mask = soft_mask
+        self.temperature = temperature
         self.attention_mask = None
 
     def set_covisibility_mask(self, images: torch.Tensor):
@@ -59,8 +71,10 @@ class SparseAttentionAggregator(nn.Module):
             for b in range(B):
                 mask = self.megaloc.compute_covisibility_matrix(
                     features[b],
-                    threshold=0.7,
-                    k_nearest=10  # Each image attends to 10 nearest
+                    threshold=self.threshold,
+                    k_nearest=self.k_nearest,  # Each image attends to k nearest
+                    soft=self.soft_mask,
+                    temperature=self.temperature
                 )
                 masks.append(mask)
 
@@ -106,7 +120,13 @@ class SparseAttentionAggregator(nn.Module):
 
 def make_vggt_sparse(
     vggt_model: nn.Module,
-    device: str = "mps"
+    device: str = "mps",
+    k_nearest: int = 10,
+    threshold: float = 0.7,
+    megaloc: Optional[MegaLocMPS] = None,
+    lightweight: bool = True,
+    soft_mask: bool = False,
+    temperature: float = 0.1
 ) -> nn.Module:
     """
     Convert regular VGGT to sparse attention version
@@ -115,19 +135,35 @@ def make_vggt_sparse(
     Args:
         vggt_model: Pretrained VGGT model
         device: Device to use (mps/cuda/cpu)
+        k_nearest: Number of nearest neighbors for sparse attention (default: 10)
+        threshold: Covisibility threshold for feature similarity (default: 0.7)
+        megaloc: Optional pre-constructed MegaLocMPS instance (avoids reloading DINOv2)
+        lightweight: If True, skip DINOv2 to save memory (default: True for MPS)
+        soft_mask: If True, use soft probabilistic masks instead of hard binary masks.
+                   Soft masks provide smoother gradient flow at decision boundaries.
+        temperature: Temperature for soft mask sigmoid (default: 0.1).
+                     Lower values approach hard mask behavior.
 
     Returns:
         VGGT model with sparse attention
     """
 
-    print("🔧 Converting VGGT to sparse attention...")
+    print(f"🔧 Converting VGGT to sparse attention (k={k_nearest}, τ={threshold}, soft={soft_mask}, T={temperature}, lightweight={lightweight})...")
 
-    # Initialize MegaLoc
-    megaloc = MegaLocMPS(device=device)
+    # Reuse provided MegaLocMPS or build a new one
+    if megaloc is None:
+        megaloc = MegaLocMPS(device=device, lightweight=lightweight)
 
     # Replace aggregator with sparse version
     original_aggregator = vggt_model.aggregator
-    sparse_aggregator = SparseAttentionAggregator(original_aggregator, megaloc)
+    sparse_aggregator = SparseAttentionAggregator(
+        original_aggregator,
+        megaloc,
+        k_nearest=k_nearest,
+        threshold=threshold,
+        soft_mask=soft_mask,
+        temperature=temperature
+    )
 
     # Monkey-patch the model
     vggt_model.aggregator = sparse_aggregator
@@ -146,7 +182,7 @@ def make_vggt_sparse(
     vggt_model.forward = forward_with_mask
 
     print("✅ VGGT converted to sparse attention!")
-    print("   - Memory usage: O(n*k) instead of O(n²)")
+    print(f"   - Memory usage: O(n*{k_nearest}) instead of O(n²)")
     print("   - No retraining needed!")
 
     return vggt_model

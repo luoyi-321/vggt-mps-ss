@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from PIL import Image
 import numpy as np
+import glob
 
 print("=" * 60)
 print("🍎 VGGT Real Model Test on MPS")
@@ -15,14 +16,17 @@ print("=" * 60)
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Device: {device}")
 
+# Project root
+PROJECT_ROOT = Path(__file__).parent.parent
+
 # Add VGGT to path
-sys.path.insert(0, str(Path(__file__).parent / "repo" / "vggt"))
+sys.path.insert(0, str(PROJECT_ROOT / "repo" / "vggt"))
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
-# Check if model file exists
-model_path = Path(__file__).parent / "repo" / "vggt" / "vggt_model.pt"
+# Check if model file exists (correct path: models/model.pt)
+model_path = PROJECT_ROOT / "models" / "model.pt"
 if not model_path.exists():
     print(f"❌ Model file not found at {model_path}")
     print("Please download from: https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt")
@@ -39,13 +43,26 @@ model = model.to(device)
 model.eval()
 print("✅ Model loaded!")
 
-# Create test images if needed
-test_dir = Path(__file__).parent / "tmp" / "inputs"
-test_dir.mkdir(parents=True, exist_ok=True)
+# Find real test images from data/real_data/
+real_data_dir = PROJECT_ROOT / "data" / "real_data"
+test_images = []
 
-test_images = list(test_dir.glob("*.jpg"))[:2]  # Use only 2 images for speed
+# Search for real images in bottle_cap directory (or any available object)
+for obj_dir in ["bottle_cap", "audiojack", "end_cap", "button_battery", "eraser"]:
+    obj_path = real_data_dir / obj_dir
+    if obj_path.exists():
+        # Find jpg images
+        found_images = sorted(glob.glob(str(obj_path / "**" / "*.jpg"), recursive=True))[:2]
+        if found_images:
+            test_images = [Path(p) for p in found_images]
+            print(f"\n📸 Using real images from {obj_dir}/")
+            break
+
+# Fallback to synthetic images if no real data found
 if not test_images:
-    print("\n📸 Creating test images...")
+    print("\n⚠️ No real images found, creating synthetic test images...")
+    test_dir = Path(__file__).parent / "tmp" / "inputs"
+    test_dir.mkdir(parents=True, exist_ok=True)
     for i in range(2):
         img = Image.new('RGB', (640, 480), color=(100 + i*50, 150, 200 - i*30))
         img_path = test_dir / f"quick_test_{i+1}.jpg"

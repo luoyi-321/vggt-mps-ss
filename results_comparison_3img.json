@@ -1,0 +1,58 @@
+{
+  "dense": {
+    "depth_l1": -1.0,
+    "depth_abs_rel": -1.0,
+    "depth_sq_rel": 0.0,
+    "depth_rmse": 0.0,
+    "rotation_error_deg": 0.0,
+    "translation_error": 0.0,
+    "inference_time_ms": 14414.51624999172,
+    "peak_memory_mb": 4869.975830078125,
+    "sparsity_ratio": 0.0,
+    "k_nearest": 0,
+    "num_images": 3,
+    "mode": "dense"
+  },
+  "sparse_k3": {
+    "depth_l1": -1.0,
+    "depth_abs_rel": -1.0,
+    "depth_sq_rel": 0.0,
+    "depth_rmse": 0.0,
+    "rotation_error_deg": 0.0,
+    "translation_error": 0.0,
+    "inference_time_ms": 16497.471292008413,
+    "peak_memory_mb": 4905.361572265625,
+    "sparsity_ratio": 0.0,
+    "k_nearest": 2,
+    "num_images": 3,
+    "mode": "sparse"
+  },
+  "sparse_k5": {
+    "depth_l1": -1.0,
+    "depth_abs_rel": -1.0,
+    "depth_sq_rel": 0.0,
+    "depth_rmse": 0.0,
+    "rotation_error_deg": 0.0,
+    "translation_error": 0.0,
+    "inference_time_ms": 26360.16554199159,
+    "peak_memory_mb": 4905.361572265625,
+    "sparsity_ratio": 0.0,
+    "k_nearest": 2,
+    "num_images": 3,
+    "mode": "sparse"
+  },
+  "sparse_k10": {
+    "depth_l1": -1.0,
+    "depth_abs_rel": -1.0,
+    "depth_sq_rel": 0.0,
+    "depth_rmse": 0.0,
+    "rotation_error_deg": 0.0,
+    "translation_error": 0.0,
+    "inference_time_ms": 20424.92391698761,
+    "peak_memory_mb": 4905.361572265625,
+    "sparsity_ratio": 0.0,
+    "k_nearest": 2,
+    "num_images": 3,
+    "mode": "sparse"
+  }
+}

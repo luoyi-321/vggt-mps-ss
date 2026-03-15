@@ -67,7 +67,7 @@ for dir_path in [DATA_DIR, OUTPUT_DIR, MODEL_DIR]:
 MODEL_CONFIG = {
     "name": "VGGT-1B",
     "huggingface_id": "facebook/VGGT-1B",
-    "local_path": MODEL_DIR / "vggt_model.pt",
+    "local_path": MODEL_DIR / "model.pt",
     "model_size": "5GB",
     "parameters": "1B",
 }

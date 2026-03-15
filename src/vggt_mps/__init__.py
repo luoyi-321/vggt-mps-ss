@@ -20,6 +20,21 @@ from .config import (
     is_model_available,
 )
 
+# Efficiency metrics (Phase 1)
+from .efficiency_metrics import (
+    EfficiencyMetrics,
+    EfficiencyReport,
+    MPSHardwareMetrics,
+)
+
+# Probabilistic aggregation (Phase 3)
+from .probabilistic_aggregation import (
+    probabilistic_geometry_aggregation,
+    probabilistic_depth_aggregation,
+    gmm_semantic_aggregation,
+    ProbabilisticMultiViewFusion,
+)
+
 __all__ = [
     # Version info
     "__version__",
@@ -34,4 +49,13 @@ __all__ = [
     "get_device",
     "get_model_path",
     "is_model_available",
+    # Efficiency metrics
+    "EfficiencyMetrics",
+    "EfficiencyReport",
+    "MPSHardwareMetrics",
+    # Probabilistic aggregation
+    "probabilistic_geometry_aggregation",
+    "probabilistic_depth_aggregation",
+    "gmm_semantic_aggregation",
+    "ProbabilisticMultiViewFusion",
 ]

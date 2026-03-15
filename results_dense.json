@@ -1,0 +1,14 @@
+{
+  "depth_l1": -1.0,
+  "depth_abs_rel": -1.0,
+  "depth_sq_rel": 0.0,
+  "depth_rmse": 0.0,
+  "rotation_error_deg": 0.0,
+  "translation_error": 0.0,
+  "inference_time_ms": 5494.395167013863,
+  "peak_memory_mb": 4844.43701171875,
+  "sparsity_ratio": 0.0,
+  "k_nearest": 0,
+  "num_images": 2,
+  "mode": "dense"
+}

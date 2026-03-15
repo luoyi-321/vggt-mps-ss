@@ -6,8 +6,12 @@ import torch
 import numpy as np
 from PIL import Image
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import sys
+
+from vggt_mps.probabilistic_aggregation import (
+    probabilistic_depth_aggregation
+)
 
 # Add VGGT repo to path
 REPO_PATH = Path(__file__).parent.parent / "repo" / "vggt"
@@ -52,10 +56,11 @@ class VGGTProcessor:
             return
 
         if model_path is None:
-            # Default paths to check
+            # Default paths to check (in priority order)
             possible_paths = [
-                Path(__file__).parent.parent / "models" / "vggt_model.pt",
-                Path(__file__).parent.parent / "repo" / "vggt" / "vggt_model.pt",
+                Path(__file__).parent.parent.parent / "models" / "model.pt",  # Primary: models/model.pt
+                Path(__file__).parent.parent.parent / "models" / "vggt_model.pt",  # Alternate name
+                Path(__file__).parent.parent.parent / "repo" / "vggt" / "vggt_model.pt",  # Legacy location
             ]
             for path in possible_paths:
                 if path.exists():
@@ -282,3 +287,46 @@ class VGGTProcessor:
             all_points.append(points)
 
         return np.vstack(all_points)
+
+    def fuse_multiview_depths(
+        self,
+        depths_per_view: torch.Tensor,
+        confidences_per_view: torch.Tensor,
+        method: str = 'probabilistic'
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fuse depth maps from multiple views.
+
+        Supports probabilistic aggregation (inspired by GaussianFormer-2) and
+        simple additive baseline for comparison.
+
+        Args:
+            depths_per_view: [N, H, W] depth maps from N views
+            confidences_per_view: [N, H, W] confidence maps in [0, 1]
+            method: 'probabilistic' (ours, default) or 'additive' (baseline)
+
+        Returns:
+            fused_depth: [H, W] aggregated depth map
+            fused_confidence: [H, W] aggregated confidence map
+
+        Example:
+            >>> proc = VGGTProcessor()
+            >>> depths = torch.rand(5, 256, 256)
+            >>> confs = torch.rand(5, 256, 256)
+            >>> fused, conf = proc.fuse_multiview_depths(depths, confs)
+            >>> print(fused.shape)  # [256, 256]
+        """
+        if method == 'probabilistic':
+            return probabilistic_depth_aggregation(
+                depths_per_view,
+                confidences_per_view
+            )
+        else:
+            # Additive baseline: weighted mean
+            eps = 1e-7
+            weights = confidences_per_view / (
+                confidences_per_view.sum(dim=0, keepdim=True) + eps
+            )
+            depth = (weights * depths_per_view).sum(dim=0)
+            conf = confidences_per_view.mean(dim=0)
+            return depth, conf

@@ -20,16 +20,21 @@ class MegaLocMPS(nn.Module):
         cluster_dim: int = 256,
         token_dim: int = 256,
         mlp_dim: int = 512,
-        device: str = "mps"
+        device: str = "mps",
+        lightweight: bool = False,
     ):
         super().__init__()
 
         # Device setup
         self.device = torch.device(device if torch.backends.mps.is_available() else "cpu")
-        print(f"MegaLoc using device: {self.device}")
+        self.lightweight = lightweight
 
-        # DINOv2 backbone (we'll use torch.hub to load)
-        self.backbone = self._load_dinov2()
+        # DINOv2 backbone (skip if lightweight mode to save memory)
+        if lightweight:
+            print("   Using lightweight mode (no DINOv2, simple pixel features)")
+            self.backbone = None
+        else:
+            self.backbone = self._load_dinov2()
 
         # SALAD aggregator components
         self.cluster_dim = cluster_dim
@@ -78,6 +83,14 @@ class MegaLocMPS(nn.Module):
         """
         B = images.shape[0]
 
+        # Lightweight mode: use simple downsampled pixel features
+        if self.lightweight or self.backbone is None:
+            # Downsample to 32x32 and flatten as feature vector
+            small = F.interpolate(images, size=(32, 32), mode='bilinear')
+            features = small.reshape(B, -1)  # [B, 3*32*32] = [B, 3072]
+            features = F.normalize(features, p=2, dim=-1)
+            return features
+
         # Resize to multiple of 14 for ViT
         H, W = images.shape[-2:]
         new_H = (H // 14) * 14
@@ -120,33 +133,51 @@ class MegaLocMPS(nn.Module):
         self,
         features: torch.Tensor,
         threshold: float = 0.7,
-        k_nearest: Optional[int] = None
+        k_nearest: Optional[int] = None,
+        soft: bool = False,
+        temperature: float = 0.1
     ) -> torch.Tensor:
         """
         Compute covisibility matrix from features
+
+        Supports both hard binary masks and soft probabilistic masks.
+        Soft masks use sigmoid function for smooth gradient flow.
+
+        Hard mask:  M(i,j) = 1 if sim(i,j) > τ else 0
+        Soft mask:  M(i,j) = σ((sim(i,j) - τ) / T)
 
         Args:
             features: [N, D] feature vectors
             threshold: Similarity threshold for covisibility
             k_nearest: If set, ensure each image connects to k nearest neighbors
+            soft: If True, use soft probabilistic mask instead of hard binary
+            temperature: Temperature for soft mask sigmoid (lower = sharper)
 
         Returns:
-            mask: [N, N] binary covisibility matrix (1 = covisible, 0 = not)
+            mask: [N, N] covisibility matrix
+                  - Binary (0/1) if soft=False
+                  - Continuous [0,1] if soft=True
         """
         N = features.shape[0]
 
         # Compute pairwise cosine similarities
         similarities = torch.mm(features, features.t())  # [N, N]
 
-        # Create binary mask
-        mask = (similarities > threshold).float()
+        # Create mask based on mode
+        if soft:
+            # Soft probabilistic mask: σ((sim - τ) / T)
+            # Temperature controls sharpness: T→0 approaches hard mask
+            mask = torch.sigmoid((similarities - threshold) / temperature)
+        else:
+            # Hard binary mask
+            mask = (similarities > threshold).float()
 
         # Ensure k-nearest neighbors if specified
         if k_nearest is not None and k_nearest > 0:
             # Get k nearest for each image
             _, indices = similarities.topk(min(k_nearest, N), dim=1)
 
-            # Add k-nearest connections
+            # Add k-nearest connections (always hard 1.0 for guaranteed connectivity)
             for i in range(N):
                 mask[i, indices[i]] = 1.0
                 mask[indices[i], i] = 1.0  # Symmetric
@@ -155,6 +186,34 @@ class MegaLocMPS(nn.Module):
         mask.fill_diagonal_(1.0)
 
         return mask
+
+    def compute_soft_covisibility(
+        self,
+        features: torch.Tensor,
+        threshold: float = 0.7,
+        temperature: float = 0.1
+    ) -> torch.Tensor:
+        """
+        Convenience method for soft probabilistic covisibility mask.
+
+        Based on GaussianFormer-2 style probabilistic modeling.
+        Preserves gradient information at decision boundaries.
+
+        Args:
+            features: [N, D] feature vectors
+            threshold: Similarity threshold for covisibility
+            temperature: Temperature parameter (default: 0.1)
+
+        Returns:
+            mask: [N, N] soft covisibility matrix with values in [0, 1]
+        """
+        return self.compute_covisibility_matrix(
+            features,
+            threshold=threshold,
+            k_nearest=None,
+            soft=True,
+            temperature=temperature
+        )
 
     def generate_attention_mask_for_vggt(
         self,

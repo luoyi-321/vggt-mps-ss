@@ -61,8 +61,35 @@ Examples:
 
     # Benchmark command
     bench_parser = subparsers.add_parser("benchmark", help="Benchmark performance")
-    bench_parser.add_argument("--images", type=int, default=10, help="Number of images")
-    bench_parser.add_argument("--compare", action="store_true", help="Compare sparse vs dense")
+    bench_parser.add_argument("--mode", choices=["basic", "scaling", "consistency", "ablation-k", "ablation-tau", "ablation-mask", "visualize", "compare-methods"], default="basic",
+                             help="Benchmark mode: basic, scaling, consistency, ablation-k, ablation-tau, ablation-mask, visualize, or compare-methods")
+    bench_parser.add_argument("--images", type=str, default="10",
+                             help="Number of images (single int or comma-separated list)")
+    bench_parser.add_argument("--compare", type=str, default=None,
+                             help="Methods to compare (comma-separated, e.g., dense,sparse). "
+                                  "Use as flag for basic mode or with values for consistency mode.")
+    bench_parser.add_argument("--methods", type=str, default="dense,sparse",
+                             help="Methods to benchmark (comma-separated: dense,sparse)")
+    bench_parser.add_argument("--sparse-k", type=str, default="5,10,20",
+                             help="K-nearest values for sparse attention (comma-separated)")
+    bench_parser.add_argument("--threshold", type=str, default="0.3,0.5,0.7,0.8,0.9",
+                             help="Covisibility threshold values for ablation-tau mode (comma-separated)")
+    bench_parser.add_argument("--mask-types", type=str, default="covisibility,random,sliding_window",
+                             help="Mask types for ablation-mask mode (comma-separated)")
+    bench_parser.add_argument("--sparsity", type=str, default="0.56",
+                             help="Target sparsity (single value or comma-separated for compare-methods)")
+    bench_parser.add_argument("--metrics", type=str, default="depth_l1,pose_rotation,pose_translation,chamfer",
+                             help="Metrics to compute for consistency mode (comma-separated)")
+    bench_parser.add_argument("--output", type=str, default=None,
+                             help="Output JSON file for results")
+    bench_parser.add_argument("--output-dir", type=str, default="results/figures",
+                             help="Output directory for visualize mode figures")
+    bench_parser.add_argument("--image-dir", type=str, default=None,
+                             help="Directory containing real images for benchmarking")
+    bench_parser.add_argument("--image-size", type=str, default="640x480",
+                             help="Target image size as WxH (e.g., 640x480)")
+    bench_parser.add_argument("--recursive", action="store_true",
+                             help="Recursively search subdirectories for images")
 
     # Download model command
     download_parser = subparsers.add_parser("download", help="Download VGGT model")
