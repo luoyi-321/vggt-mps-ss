@@ -115,23 +115,25 @@ def synchronize_device():
 def compute_depth_metrics(
     pred_depth: np.ndarray,
     gt_depth: np.ndarray,
-    valid_mask: Optional[np.ndarray] = None
+    valid_mask: Optional[np.ndarray] = None,
+    align_scale: bool = True
 ) -> Dict[str, float]:
     """
-    Compute comprehensive depth metrics.
+    Compute comprehensive depth metrics with optional scale alignment.
 
     Args:
         pred_depth: Predicted depth map
         gt_depth: Ground truth depth map
         valid_mask: Optional mask for valid depth values
+        align_scale: If True, apply median scaling alignment (standard for monocular depth)
 
     Returns:
         Dictionary of metric values
     """
     if valid_mask is None:
-        valid_mask = (gt_depth > 0) & np.isfinite(gt_depth) & np.isfinite(pred_depth)
+        valid_mask = (gt_depth > 0) & np.isfinite(gt_depth) & np.isfinite(pred_depth) & (pred_depth > 0)
 
-    pred = pred_depth[valid_mask]
+    pred = pred_depth[valid_mask].copy()
     gt = gt_depth[valid_mask]
 
     if len(pred) == 0:
@@ -139,8 +141,15 @@ def compute_depth_metrics(
             "rmse": 0.0,
             "abs_rel": 0.0,
             "sq_rel": 0.0,
-            "delta_1": 0.0
+            "delta_1": 0.0,
+            "scale": 1.0
         }
+
+    # Apply median scaling alignment (standard practice for monocular depth evaluation)
+    scale = 1.0
+    if align_scale:
+        scale = np.median(gt) / (np.median(pred) + 1e-8)
+        pred = pred * scale
 
     # RMSE
     rmse = np.sqrt(np.mean((pred - gt) ** 2))
@@ -152,14 +161,15 @@ def compute_depth_metrics(
     sq_rel = np.mean(((pred - gt) ** 2) / (gt + 1e-8))
 
     # Delta accuracy (δ < 1.25)
-    thresh = np.maximum((gt / pred), (pred / gt))
+    thresh = np.maximum((gt / (pred + 1e-8)), (pred / (gt + 1e-8)))
     delta_1 = (thresh < 1.25).mean() * 100
 
     return {
         "rmse": float(rmse),
         "abs_rel": float(abs_rel),
         "sq_rel": float(sq_rel),
-        "delta_1": float(delta_1)
+        "delta_1": float(delta_1),
+        "scale": float(scale)
     }
 
 

@@ -85,24 +85,17 @@ class SparseAttentionAggregator(nn.Module):
         # Store original attention function
         original_attention = self.aggregator.attention if hasattr(self.aggregator, 'attention') else None
 
-        # Monkey-patch attention to use our mask
-        def sparse_attention(query, key, value):
-            # Standard attention
-            scores = torch.matmul(query, key.transpose(-2, -1))
-            scores = scores / (key.shape[-1] ** 0.5)
+        # Choose attention implementation based on sparsity and availability
+        use_efficient = self.attention_mask is not None and self.k_nearest < self.attention_mask.shape[-1] // 2
 
-            # Apply covisibility mask if available
-            if self.attention_mask is not None:
-                # Expand mask to match attention shape
-                mask = self.attention_mask.unsqueeze(1)  # Add head dimension
-                # Set non-covisible pairs to very negative value
-                scores = scores.masked_fill(mask == 0, -1e9)
-
-            # Softmax and apply to values
-            attn_weights = F.softmax(scores, dim=-1)
-            output = torch.matmul(attn_weights, value)
-
-            return output
+        if use_efficient:
+            # Efficient gather-based sparse attention - O(n*k) instead of O(n²)
+            def sparse_attention(query, key, value):
+                return self._efficient_sparse_attention(query, key, value)
+        else:
+            # Fallback: mask-based attention (still O(n²) compute but correct output)
+            def sparse_attention(query, key, value):
+                return self._masked_attention(query, key, value)
 
         # Temporarily replace attention
         if hasattr(self.aggregator, 'attention'):
@@ -114,6 +107,102 @@ class SparseAttentionAggregator(nn.Module):
         # Restore original attention
         if original_attention is not None:
             self.aggregator.attention = original_attention
+
+        return output
+
+    def _masked_attention(self, query, key, value):
+        """Standard attention with mask applied (O(n²) - fallback)"""
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        scores = scores / (key.shape[-1] ** 0.5)
+
+        if self.attention_mask is not None:
+            mask = self.attention_mask.unsqueeze(1)  # Add head dimension
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        attn_weights = F.softmax(scores, dim=-1)
+        output = torch.matmul(attn_weights, value)
+        return output
+
+    def _efficient_sparse_attention(self, query, key, value):
+        """
+        Efficient gather-based sparse attention - reduces compute complexity.
+
+        Complexity Analysis:
+        - Dense attention: O(N² * D) for matmul, O(N²) memory for scores
+        - This sparse: O(N * k * D) for gather + einsum, O(N * k) memory for scores
+
+        Theoretical speedup: N/k (e.g., 10x for N=100, k=10)
+
+        IMPORTANT LIMITATION:
+        PyTorch's standard operations still require some memory overhead for gathering.
+        For maximum efficiency on large N, consider:
+        - FlashAttention (CUDA only, not MPS)
+        - xFormers block-sparse attention
+        - Custom MPS/Metal kernels
+
+        This implementation provides compute savings but has memory overhead from
+        the gather operation. It's most beneficial when N is large and k << N.
+        """
+        B, H, N, D = query.shape  # [batch, heads, seq_len, head_dim]
+        k = min(self.k_nearest, N)
+
+        # Get indices of k-nearest neighbors from attention mask
+        if self.attention_mask is not None:
+            # topk returns (values, indices), we need indices
+            _, topk_indices = torch.topk(self.attention_mask, k=k, dim=-1)  # [B, N, k]
+        else:
+            # Fallback: local sliding window attention
+            indices = torch.arange(N, device=query.device)
+            offsets = torch.arange(-(k//2), k - k//2, device=query.device)
+            neighbor_idx = (indices.unsqueeze(1) + offsets.unsqueeze(0)).clamp(0, N-1)
+            topk_indices = neighbor_idx.unsqueeze(0).expand(B, -1, -1)
+
+        # === GATHER KEY/VALUE FOR K NEIGHBORS ===
+        # Strategy: Use embedding-style lookup to avoid O(N²) memory
+        # key, value: [B, H, N, D]
+        # topk_indices: [B, N, k]
+
+        # Reshape for efficient gathering: [B, H, N, D] -> [B, N, H*D]
+        key_flat = key.permute(0, 2, 1, 3).reshape(B, N, H * D)  # [B, N, H*D]
+        value_flat = value.permute(0, 2, 1, 3).reshape(B, N, H * D)  # [B, N, H*D]
+
+        # Expand indices for gathering: [B, N, k] -> [B, N, k, H*D]
+        idx_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, H * D)  # [B, N, k, H*D]
+
+        # Gather: O(B * N * k * H * D) operations, not O(N²)
+        # This selects k vectors of size H*D for each of the N query positions
+        gathered_keys_flat = torch.gather(
+            key_flat.unsqueeze(2).expand(-1, -1, k, -1),  # [B, N, k, H*D] broadcast view
+            dim=1,  # Gather along the N dimension
+            index=idx_expanded
+        )  # [B, N, k, H*D]
+
+        gathered_values_flat = torch.gather(
+            value_flat.unsqueeze(2).expand(-1, -1, k, -1),
+            dim=1,
+            index=idx_expanded
+        )
+
+        # Reshape back: [B, N, k, H*D] -> [B, H, N, k, D]
+        gathered_keys = gathered_keys_flat.reshape(B, N, k, H, D).permute(0, 3, 1, 2, 4)
+        gathered_values = gathered_values_flat.reshape(B, N, k, H, D).permute(0, 3, 1, 2, 4)
+
+        # === COMPUTE SPARSE ATTENTION ===
+        # scores: [B, H, N, k] - only k scores per query, not N
+        scores = torch.einsum('bhnd,bhnkd->bhnk', query, gathered_keys)
+        scores = scores / (D ** 0.5)
+
+        # Apply soft mask weights if enabled
+        if self.soft_mask and self.attention_mask is not None:
+            mask_gathered = torch.gather(self.attention_mask, dim=2, index=topk_indices)
+            mask_gathered = mask_gathered.unsqueeze(1).expand(-1, H, -1, -1)
+            scores = scores + torch.log(mask_gathered.clamp(min=1e-8))
+
+        # Softmax over k neighbors (not N) - this is where we save compute
+        attn_weights = F.softmax(scores, dim=-1)  # [B, H, N, k]
+
+        # Weighted sum: O(B * H * N * k * D) instead of O(B * H * N * N * D)
+        output = torch.einsum('bhnk,bhnkd->bhnd', attn_weights, gathered_values)
 
         return output
 
@@ -129,13 +218,26 @@ def make_vggt_sparse(
     temperature: float = 0.1
 ) -> nn.Module:
     """
-    Convert regular VGGT to sparse attention version
+    Convert regular VGGT to sparse attention version.
     NO RETRAINING REQUIRED - uses existing weights!
+
+    Complexity Improvements:
+    - Dense attention: O(N²) compute, O(N²) memory for attention matrix
+    - Sparse attention: O(N*k) compute for attention, O(N*k) memory for scores
+
+    When k=10 and N=100: ~10x compute reduction for attention operations
+    When k=10 and N=500: ~50x compute reduction
+
+    Limitations (PyTorch on MPS):
+    - Gathering keys/values still has some memory overhead
+    - Best speedup when N >> k (e.g., N > 50, k < 15)
+    - For maximum efficiency, would need custom Metal/CUDA kernels
 
     Args:
         vggt_model: Pretrained VGGT model
         device: Device to use (mps/cuda/cpu)
         k_nearest: Number of nearest neighbors for sparse attention (default: 10)
+                   Lower k = more sparse = faster but may lose quality
         threshold: Covisibility threshold for feature similarity (default: 0.7)
         megaloc: Optional pre-constructed MegaLocMPS instance (avoids reloading DINOv2)
         lightweight: If True, skip DINOv2 to save memory (default: True for MPS)
@@ -182,8 +284,10 @@ def make_vggt_sparse(
     vggt_model.forward = forward_with_mask
 
     print("✅ VGGT converted to sparse attention!")
-    print(f"   - Memory usage: O(n*{k_nearest}) instead of O(n²)")
-    print("   - No retraining needed!")
+    print(f"   - Attention compute: O(n*{k_nearest}) instead of O(n²)")
+    print(f"   - Score memory: O(n*{k_nearest}) instead of O(n²)")
+    print(f"   - Theoretical speedup: n/{k_nearest}x for attention ops")
+    print("   - No retraining needed - uses existing weights")
 
     return vggt_model
 

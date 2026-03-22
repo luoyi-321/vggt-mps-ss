@@ -130,6 +130,7 @@ def load_co3d_gt_depths(
 def compute_gt_depth_metrics(
     pred_depths: np.ndarray,
     gt_depths: List[Optional[np.ndarray]],
+    align_scale: bool = True,
 ) -> Dict[str, float]:
     """
     Compute depth quality metrics against CO3D ground-truth.
@@ -137,13 +138,16 @@ def compute_gt_depth_metrics(
     Args:
         pred_depths: VGGT predicted depths [1, N, H, W, 1]
         gt_depths: list of GT depth arrays (or None per frame)
+        align_scale: If True, apply median scaling alignment before computing metrics
 
     Returns:
-        Dict with avg mae, rmse, abs_rel, and count of evaluated frames
+        Dict with avg mae, rmse, abs_rel, delta_1, and count of evaluated frames
     """
     from PIL import Image as PILImage
 
-    all_mae, all_rmse, all_abs_rel = [], [], []
+    all_mae, all_rmse, all_abs_rel, all_delta1 = [], [], [], []
+    all_scales = []  # Track scale factors for reporting
+
     for i, gt in enumerate(gt_depths):
         if gt is None or gt.max() <= 0:
             continue
@@ -160,24 +164,38 @@ def compute_gt_depth_metrics(
                 )
             )
 
-        valid = np.isfinite(pred) & np.isfinite(gt) & (gt > 0)
+        valid = np.isfinite(pred) & np.isfinite(gt) & (gt > 0) & (pred > 0)
         if valid.sum() < 10:
             continue
 
         p, g = pred[valid], gt[valid]
+
+        # Apply median scaling alignment (standard practice for monocular depth)
+        if align_scale:
+            scale = np.median(g) / (np.median(p) + 1e-8)
+            p = p * scale
+            all_scales.append(scale)
+
         diff = np.abs(p - g)
         all_mae.append(float(np.mean(diff)))
         all_rmse.append(float(np.sqrt(np.mean(diff**2))))
         all_abs_rel.append(float(np.mean(diff / (g + 1e-8))))
 
+        # Delta accuracy (threshold = 1.25)
+        thresh = np.maximum(p / (g + 1e-8), g / (p + 1e-8))
+        delta1 = float((thresh < 1.25).mean() * 100)
+        all_delta1.append(delta1)
+
     if not all_mae:
-        return {"gt_mae": -1.0, "gt_rmse": -1.0, "gt_abs_rel": -1.0, "gt_frames": 0}
+        return {"gt_mae": -1.0, "gt_rmse": -1.0, "gt_abs_rel": -1.0, "gt_delta1": -1.0, "gt_frames": 0, "gt_scale": -1.0}
 
     return {
         "gt_mae": float(np.mean(all_mae)),
         "gt_rmse": float(np.mean(all_rmse)),
         "gt_abs_rel": float(np.mean(all_abs_rel)),
+        "gt_delta1": float(np.mean(all_delta1)),
         "gt_frames": len(all_mae),
+        "gt_scale": float(np.mean(all_scales)) if all_scales else 1.0,
     }
 
 
