@@ -803,8 +803,8 @@ def main():
 
     # ── CO3D options ───────────────────────────────────────────
     parser.add_argument(
-        "--co3d-category", type=str, default="tv",
-        help="CO3D category to use (default: tv)",
+        "--co3d-category", type=str, default="skateboard",
+        help="CO3D category to use (default: chair)",
     )
     parser.add_argument(
         "--sequence", type=str, default=None,
