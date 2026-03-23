@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import json
 import shutil
 import sys
@@ -61,31 +62,77 @@ def get_available_categories(source_dir: Path) -> List[str]:
     return [cat for cat in links.keys() if cat != "METADATA"]
 
 
+def load_category_annotations(source_dir: Path, category: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load frame annotations from CO3D v2 category-level .jgz file.
+
+    CO3D v2 stores annotations as gzipped JSON at the category level:
+      category/frame_annotations.jgz
+
+    Each entry has: sequence_name, frame_number, viewpoint (R, T, focal_length, etc.),
+    image, depth, mask.
+
+    Args:
+        source_dir: Path to CO3D source directory
+        category: Category name
+
+    Returns:
+        Dictionary mapping sequence_name -> list of frame annotations, sorted by frame_number
+    """
+    annot_file = source_dir / category / "frame_annotations.jgz"
+    if not annot_file.exists():
+        print(f"  Warning: No frame_annotations.jgz found for {category}")
+        return {}
+
+    print(f"  Loading annotations from {annot_file.name}...")
+    with gzip.open(annot_file, "rb") as f:
+        all_annotations = json.loads(f.read())
+
+    # Group by sequence_name
+    seq_annotations = {}
+    for entry in all_annotations:
+        seq_name = entry.get("sequence_name", "unknown")
+        if seq_name not in seq_annotations:
+            seq_annotations[seq_name] = []
+        seq_annotations[seq_name].append(entry)
+
+    # Sort each sequence by frame_number
+    for seq_name in seq_annotations:
+        seq_annotations[seq_name].sort(key=lambda x: x.get("frame_number", 0))
+
+    print(f"  Loaded {len(all_annotations)} annotations across {len(seq_annotations)} sequences")
+    return seq_annotations
+
+
 def find_sequence_data(
     source_dir: Path,
-    category: str
+    category: str,
+    category_annotations: Dict[str, List[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
     """
     Find sequence data for a given category.
 
     CO3D v2 structure:
     - category/
+        - frame_annotations.jgz   (category-level annotations)
+        - sequence_annotations.jgz
         - sequence_name/
-            - images/
-            - depth_maps/
-            - frame_annotations.json
-            - sequence_annotations.json
+            - images/              (*.jpg)
+            - depths/              (*.jpg.geometric.png)
+            - masks/
+            - depth_masks/
+            - pointcloud.ply
 
     Args:
         source_dir: Path to CO3D source directory
-        category: Category name (e.g., 'bottle', 'chair')
+        category: Category name
+        category_annotations: Pre-loaded annotations grouped by sequence
 
     Returns:
         List of sequence info dictionaries
     """
     category_dir = source_dir / category
     if not category_dir.exists():
-        # Check if we need to look in a different location
         return []
 
     sequences = []
@@ -93,28 +140,29 @@ def find_sequence_data(
         if not seq_dir.is_dir():
             continue
 
+        seq_name = seq_dir.name
         seq_info = {
-            'name': seq_dir.name,
+            'name': seq_name,
             'path': seq_dir,
+            'category': category,
             'images': [],
             'depths': [],
-            'annotations': None
+            'annotations': category_annotations.get(seq_name, [])
         }
 
-        # Find images
+        # Find images in images/ directory
         images_dir = seq_dir / "images"
         if images_dir.exists():
             seq_info['images'] = sorted(images_dir.glob("*.jpg")) + sorted(images_dir.glob("*.png"))
 
-        # Find depth maps
-        depth_dir = seq_dir / "depth_maps"
+        # Find depth maps in depths/ directory (CO3D v2 uses "depths", not "depth_maps")
+        depth_dir = seq_dir / "depths"
         if depth_dir.exists():
-            seq_info['depths'] = sorted(depth_dir.glob("*.png")) + sorted(depth_dir.glob("*.npy"))
-
-        # Find annotations
-        annot_file = seq_dir / "frame_annotations.json"
-        if annot_file.exists():
-            seq_info['annotations'] = annot_file
+            # CO3D depth files: frameXXXXXX.jpg.geometric.png
+            seq_info['depths'] = sorted(depth_dir.glob("*.geometric.png"))
+            # Also check for .npy and regular .png
+            if not seq_info['depths']:
+                seq_info['depths'] = sorted(depth_dir.glob("*.png")) + sorted(depth_dir.glob("*.npy"))
 
         if seq_info['images']:
             sequences.append(seq_info)
@@ -122,30 +170,15 @@ def find_sequence_data(
     return sequences
 
 
-def load_frame_annotations(annot_path: Path) -> List[Dict[str, Any]]:
-    """
-    Load frame annotations from CO3D JSON file.
-
-    Args:
-        annot_path: Path to frame_annotations.json
-
-    Returns:
-        List of frame annotation dictionaries
-    """
-    with open(annot_path, "r") as f:
-        data = json.load(f)
-    return data
-
-
 def extract_camera_pose(frame_annot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Extract camera pose from frame annotation.
+    Extract camera pose from CO3D frame annotation.
 
     CO3D provides camera parameters including:
     - R: 3x3 rotation matrix
     - T: 3D translation vector
-    - focal_length: (fx, fy)
-    - principal_point: (cx, cy)
+    - focal_length: [fx, fy]
+    - principal_point: [cx, cy]
 
     Args:
         frame_annot: Frame annotation dictionary
@@ -161,9 +194,35 @@ def extract_camera_pose(frame_annot: Dict[str, Any]) -> Optional[Dict[str, Any]]
         'R': np.array(viewpoint.get("R", [[1, 0, 0], [0, 1, 0], [0, 0, 1]])),
         'T': np.array(viewpoint.get("T", [0, 0, 0])),
         'focal_length': viewpoint.get("focal_length", [1.0, 1.0]),
-        'principal_point': viewpoint.get("principal_point", [0.5, 0.5])
+        'principal_point': viewpoint.get("principal_point", [0.5, 0.5]),
+        'intrinsics_format': viewpoint.get("intrinsics_format", "ndc_isotropic")
     }
     return pose
+
+
+def build_frame_name_to_annotation_map(
+    annotations: List[Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a mapping from image filename to its annotation entry.
+
+    CO3D annotation has image.path like 'tv/28_967_2810/images/frame000001.jpg',
+    so we extract the basename to match against the actual image files.
+
+    Args:
+        annotations: List of frame annotations for a sequence
+
+    Returns:
+        Dict mapping image basename -> annotation entry
+    """
+    mapping = {}
+    for annot in annotations:
+        img_info = annot.get("image", {})
+        img_path = img_info.get("path", "")
+        if img_path:
+            basename = Path(img_path).name
+            mapping[basename] = annot
+    return mapping
 
 
 def prepare_sequence(
@@ -187,18 +246,50 @@ def prepare_sequence(
     seq_name = seq_info['name']
     seq_output = output_dir / seq_name
 
+    # Build annotation lookup map
+    annot_map = build_frame_name_to_annotation_map(seq_info['annotations'])
+    has_annotations = len(annot_map) > 0
+
+    # Build depth lookup map (image basename -> depth path)
+    depth_map = {}
+    for depth_path in seq_info['depths']:
+        # CO3D depth naming: frame000001.jpg.geometric.png -> frame000001.jpg
+        depth_name = depth_path.name
+        # Remove .geometric.png suffix to get original image name
+        if ".geometric.png" in depth_name:
+            img_name = depth_name.replace(".geometric.png", "")
+            depth_map[img_name] = depth_path
+        elif depth_name.endswith(".png") or depth_name.endswith(".npy"):
+            # Try to match by frame number
+            depth_map[depth_name] = depth_path
+
+    # Count how many frames have poses and depth
+    n_with_poses = 0
+    n_with_depth = 0
+    for img_path in seq_info['images'][:max_frames]:
+        img_name = img_path.name
+        if img_name in annot_map:
+            annot = annot_map[img_name]
+            if annot.get("viewpoint") is not None:
+                n_with_poses += 1
+        if img_name in depth_map:
+            n_with_depth += 1
+
+    n_extracted = min(len(seq_info['images']), max_frames)
+
     result = {
         'name': seq_name,
+        'category': seq_info.get('category', ''),
         'n_images': len(seq_info['images']),
         'n_depths': len(seq_info['depths']),
-        'n_extracted': 0,
-        'has_poses': False,
+        'n_extracted': n_extracted,
+        'has_poses': n_with_poses > 0,
+        'n_with_poses': n_with_poses,
+        'n_with_depth': n_with_depth,
         'output_dir': str(seq_output)
     }
 
     if dry_run:
-        result['n_extracted'] = min(len(seq_info['images']), max_frames)
-        result['has_poses'] = seq_info['annotations'] is not None
         return result
 
     # Create output directories
@@ -207,58 +298,69 @@ def prepare_sequence(
     (seq_output / "depth").mkdir(exist_ok=True)
     (seq_output / "poses").mkdir(exist_ok=True)
 
-    # Select frames (evenly spaced if more than max_frames)
+    # Select frames (use first max_frames)
     images = seq_info['images'][:max_frames]
     n_frames = len(images)
 
-    # Load annotations if available
-    annotations = []
-    if seq_info['annotations']:
-        annotations = load_frame_annotations(seq_info['annotations'])
-        result['has_poses'] = True
+    poses_saved = 0
+    depths_saved = 0
 
     # Copy images and extract data
     for i, img_path in enumerate(images):
         frame_name = f"frame_{i:04d}"
+        img_basename = img_path.name
 
         # Copy image
         dst_img = seq_output / "images" / f"{frame_name}.jpg"
         shutil.copy2(img_path, dst_img)
 
-        # Copy depth if available
-        if i < len(seq_info['depths']):
-            depth_path = seq_info['depths'][i]
+        # Copy depth if available (match by image filename)
+        if img_basename in depth_map:
+            depth_path = depth_map[img_basename]
             dst_depth = seq_output / "depth" / f"{frame_name}.npy"
             if depth_path.suffix == ".npy":
                 shutil.copy2(depth_path, dst_depth)
+                depths_saved += 1
             else:
                 # Convert PNG depth to numpy
                 try:
                     from PIL import Image
                     depth_img = Image.open(depth_path)
                     depth_array = np.array(depth_img).astype(np.float32)
-                    # Normalize depth (CO3D uses 16-bit PNG, scale factor 1000)
-                    depth_array = depth_array / 1000.0
+                    # CO3D uses 16-bit PNG depth maps
+                    # Scale factor from annotation if available
+                    scale = 1.0
+                    if img_basename in annot_map:
+                        depth_info = annot_map[img_basename].get("depth", {})
+                        scale = depth_info.get("scale_adjustment", 1.0)
+                    depth_array = depth_array * scale / 65535.0  # Normalize 16-bit
                     np.save(dst_depth, depth_array)
+                    depths_saved += 1
                 except Exception as e:
-                    print(f"Warning: Could not convert depth {depth_path}: {e}")
+                    print(f"    Warning: Could not convert depth {depth_path.name}: {e}")
 
-        # Extract pose if available
-        if i < len(annotations):
-            pose = extract_camera_pose(annotations[i])
+        # Extract pose from annotation (match by image filename)
+        if img_basename in annot_map:
+            annot = annot_map[img_basename]
+            pose = extract_camera_pose(annot)
             if pose:
                 pose_file = seq_output / "poses" / f"{frame_name}.npz"
-                np.savez(pose_file, **pose)
+                np.savez(pose_file, **{k: np.array(v) if not isinstance(v, np.ndarray) else v for k, v in pose.items()})
+                poses_saved += 1
 
-        result['n_extracted'] += 1
+    result['poses_saved'] = poses_saved
+    result['depths_saved'] = depths_saved
 
     # Save metadata
     metadata = {
         'sequence_name': seq_name,
+        'category': seq_info.get('category', ''),
         'n_frames': n_frames,
         'source_path': str(seq_info['path']),
-        'has_depth': len(seq_info['depths']) > 0,
-        'has_poses': result['has_poses']
+        'has_depth': depths_saved > 0,
+        'has_poses': poses_saved > 0,
+        'n_depths': depths_saved,
+        'n_poses': poses_saved
     }
     with open(seq_output / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -326,8 +428,11 @@ def prepare_benchmark_data(
         print(f"\n--- Processing: {cat} ---")
         cat_output = output_dir / cat
 
+        # Load category-level annotations first
+        category_annotations = load_category_annotations(source_dir, cat)
+
         # Find sequences
-        sequences = find_sequence_data(source_dir, cat)
+        sequences = find_sequence_data(source_dir, cat, category_annotations)
         if not sequences:
             print(f"  No sequences found for {cat}")
             print(f"  (Category may need to be downloaded first)")
@@ -335,7 +440,8 @@ def prepare_benchmark_data(
 
         print(f"  Found {len(sequences)} sequences")
 
-        # Select sequences
+        # Select sequences (prefer those with more depth data and annotations)
+        sequences.sort(key=lambda s: (len(s['annotations']), len(s['depths']), len(s['images'])), reverse=True)
         selected_seqs = sequences[:sequences_per_category]
         cat_results = []
 
@@ -347,11 +453,19 @@ def prepare_benchmark_data(
                 dry_run=dry_run
             )
             cat_results.append(result)
-            print(f"  - {result['name']}: {result['n_extracted']} frames, poses={result['has_poses']}")
+            status_parts = [f"{result['n_extracted']} frames"]
+            if result.get('has_poses'):
+                status_parts.append(f"poses={result.get('n_with_poses', '?')}")
+            else:
+                status_parts.append("poses=0")
+            status_parts.append(f"depth={result.get('n_with_depth', 0)}")
+            print(f"  - {result['name']}: {', '.join(status_parts)}")
 
         summary['categories'][cat] = {
             'n_sequences': len(cat_results),
             'total_frames': sum(r['n_extracted'] for r in cat_results),
+            'total_poses': sum(r.get('n_with_poses', 0) for r in cat_results),
+            'total_depths': sum(r.get('n_with_depth', 0) for r in cat_results),
             'sequences': cat_results
         }
         summary['total_sequences'] += len(cat_results)
@@ -370,6 +484,11 @@ def prepare_benchmark_data(
     print(f"Categories: {len(summary['categories'])}")
     print(f"Sequences: {summary['total_sequences']}")
     print(f"Total frames: {summary['total_frames']}")
+    for cat_name, cat_info in summary['categories'].items():
+        print(f"  {cat_name}: {cat_info['n_sequences']} seqs, "
+              f"{cat_info['total_frames']} frames, "
+              f"{cat_info['total_poses']} poses, "
+              f"{cat_info['total_depths']} depths")
 
     if dry_run:
         print("\n[DRY RUN COMPLETE - Run without --dry-run to extract data]")
