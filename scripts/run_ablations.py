@@ -788,6 +788,202 @@ def run_multi_sequence_ablation(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Novel ablation 1: Covisibility mode comparison
+# visual vs. adaptive-k vs. pose-guided
+# ═══════════════════════════════════════════════════════════════
+
+def run_covis_mode_ablation(
+    image_dir: Path,
+    k_nearest: int = 10,
+    max_images: int = 50,
+    n_runs: int = 3,
+    output_file: Optional[Path] = None,
+    sequence_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Novel ablation: compare covisibility estimation strategies.
+
+    Modes:
+      dense    — full O(S²) attention (baseline)
+      visual   — DINOv2/pixel similarity k-NN (original)
+      adaptive — per-frame adaptive k based on isolation score
+      pose     — geometric frustum overlap from predicted camera poses
+
+    The adaptive and pose-guided modes are new contributions.
+    """
+    from evaluate_vggt import get_device, clear_memory
+    import torch
+
+    device = get_device()
+
+    print("=" * 70)
+    print("Covisibility Mode Ablation (novel contribution)")
+    print("=" * 70)
+    print(f"Modes: dense | visual | adaptive | pose-guided")
+    print(f"k={k_nearest}, images={max_images}")
+
+    results = {
+        "ablation": "covis_mode",
+        "k_nearest": k_nearest,
+        "max_images": max_images,
+        "n_runs": n_runs,
+        "configurations": {},
+    }
+
+    modes = [
+        ("dense",    {"mode": "dense"}),
+        ("visual",   {"mode": "sparse", "covis_mode": "visual"}),
+        ("adaptive", {"mode": "sparse", "covis_mode": "adaptive"}),
+    ]
+
+    for mode_name, kwargs in modes:
+        print(f"\n--- {mode_name} ---")
+        try:
+            from evaluate_vggt import load_model, evaluate, run_with_statistics
+
+            if kwargs["mode"] == "dense":
+                model = load_model(device, mode="dense")
+            else:
+                # Patch load_model to pass covis_mode via env
+                import os
+                os.environ["VGGT_COVIS_MODE"] = kwargs.get("covis_mode", "visual")
+                model = load_model(device, mode="sparse", k_nearest=k_nearest)
+
+            times = []
+            for _ in range(n_runs):
+                m = evaluate(image_dir, mode=kwargs["mode"],
+                             k_nearest=k_nearest, max_images=max_images,
+                             model=model)
+                times.append(m.inference_time_ms)
+
+            config = {
+                "mode": mode_name,
+                "time_ms": float(np.mean(times)),
+                "time_std": float(np.std(times)) if len(times) > 1 else 0.0,
+                "memory_mb": m.peak_memory_mb,
+                "sparsity": m.sparsity_ratio,
+            }
+
+            if sequence_dir:
+                # GT depth comparison
+                img_names = sorted(
+                    list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
+                )[:max_images]
+                from vggt.utils.load_fn import load_and_preprocess_images
+                input_tensor = load_and_preprocess_images(
+                    [str(p) for p in img_names]
+                ).to(device)
+                with torch.no_grad():
+                    preds = model(input_tensor)
+                raw_depth = preds["depth"].cpu().numpy()
+                del input_tensor, preds
+                gt_depths = load_co3d_gt_depths(sequence_dir, [p.name for p in img_names])
+                config.update(compute_gt_depth_metrics(raw_depth, gt_depths))
+
+            results["configurations"][mode_name] = config
+            print(f"  Time: {config['time_ms']:.1f} ms")
+
+            del model
+            clear_memory()
+
+        except Exception as e:
+            print(f"  Error: {e}")
+            results["configurations"][mode_name] = {"error": str(e)}
+
+    if output_file:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved: {output_file}")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# Novel ablation 2: Layer entropy analysis
+# Measure which global_blocks are safe to sparsify
+# ═══════════════════════════════════════════════════════════════
+
+def run_layer_entropy_analysis(
+    image_dir: Path,
+    max_images: int = 16,
+    output_file: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Novel analysis: measure attention weight entropy per global_block layer.
+
+    High entropy → attention spread across all frames → keep dense.
+    Low entropy  → attention concentrated → safe to sparsify.
+
+    This is our own empirical evidence for layer-selective sparsity,
+    independent of Faster VGGT's findings.
+    """
+    from evaluate_vggt import get_device, load_model
+    import torch
+
+    device = get_device()
+    print("=" * 70)
+    print("Layer Entropy Analysis (novel contribution)")
+    print("=" * 70)
+
+    model = load_model(device, mode="dense")
+
+    # Attach analyzer
+    from vggt_mps.attention_analyzer import AttentionEntropyAnalyzer
+    analyzer = AttentionEntropyAnalyzer(model.aggregator)
+    analyzer.attach_hooks()
+
+    # Run forward pass
+    from vggt.utils.load_fn import load_and_preprocess_images
+    images = sorted(
+        list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
+    )[:max_images]
+
+    if not images:
+        print("No images found.")
+        return {}
+
+    input_tensor = load_and_preprocess_images([str(p) for p in images]).to(device)
+    S = input_tensor.shape[1] if input_tensor.ndim == 5 else input_tensor.shape[0]
+    analyzer.set_S(S)
+
+    with torch.no_grad():
+        _ = model(input_tensor)
+
+    analyzer.detach_hooks()
+
+    report = analyzer.get_report()
+    analyzer.print_report(report)
+
+    sparse_layers = analyzer.recommend_sparse_layers(report, percentile=0.4)
+    print(f"\nRecommended sparse_layers for this scene: {sparse_layers}")
+
+    results = {
+        "analysis": "layer_entropy",
+        "n_images": len(images),
+        "layers": [
+            {
+                "layer_idx": r.layer_idx,
+                "mean_entropy": r.mean_entropy,
+                "std_entropy": r.std_entropy,
+                "cross_frame_ratio": r.cross_frame_ratio,
+                "effective_frames": r.effective_frames,
+            }
+            for r in report
+        ],
+        "recommended_sparse_layers": sparse_layers,
+    }
+
+    if output_file:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Results saved: {output_file}")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════
 
@@ -797,7 +993,7 @@ def main():
     )
     parser.add_argument(
         "--ablation", type=str, required=True,
-        choices=["k_nearest", "threshold", "mask_type", "soft_mask"],
+        choices=["k_nearest", "threshold", "mask_type", "soft_mask", "covis_mode", "layer_entropy"],
         help="Type of ablation study to run",
     )
 
@@ -841,6 +1037,22 @@ def main():
     parser.add_argument("--temperatures", type=str, default="0.05,0.1,0.2,0.5")
     parser.add_argument("--output", type=Path, default=None)
 
+    # ── Model / precision options (from VGGT-X / Faster VGGT papers) ──
+    parser.add_argument(
+        "--bfloat16", action="store_true",
+        help="Use BFloat16 inference (VGGT-X: ~74%% VRAM reduction, MPS/CUDA only)",
+    )
+    parser.add_argument(
+        "--all-layers", action="store_true",
+        help="Apply sparse attention to all 24 global blocks "
+             "(default: middle layers 10-18 only, per Faster VGGT paper)",
+    )
+    parser.add_argument(
+        "--sparse-layers", type=str, default=None,
+        help="Comma-separated list of global_block indices to sparsify "
+             "(e.g. '10,11,12,13,14,15,16,17,18'). Overrides --all-layers default.",
+    )
+
     args = parser.parse_args()
 
     # Parse lists
@@ -848,6 +1060,24 @@ def main():
     tau_values = [float(x.strip()) for x in args.tau_values.split(",")]
     mask_types = [x.strip() for x in args.mask_types.split(",")]
     temperatures = [float(x.strip()) for x in args.temperatures.split(",")]
+
+    # Parse sparse-layers option
+    sparse_layers_arg = None
+    if args.sparse_layers:
+        sparse_layers_arg = [int(x.strip()) for x in args.sparse_layers.split(",")]
+
+    # Propagate model options into the evaluate_vggt module at import time
+    # by storing them as globals; evaluate_co3d / load_model will pick them up.
+    import importlib, sys as _sys
+    # We set module-level defaults that load_model reads via os.environ to keep
+    # things simple across the subprocess boundary.
+    import os
+    if args.bfloat16:
+        os.environ["VGGT_BFLOAT16"] = "1"
+    if args.all_layers:
+        os.environ["VGGT_ALL_LAYERS"] = "1"
+    if sparse_layers_arg is not None:
+        os.environ["VGGT_SPARSE_LAYERS"] = ",".join(str(x) for x in sparse_layers_arg)
 
     # Default output
     if args.output is None:
@@ -876,12 +1106,14 @@ def main():
                 "threshold": run_threshold_ablation,
                 "mask_type": run_mask_type_ablation,
                 "soft_mask": run_soft_mask_ablation,
+                "covis_mode": run_covis_mode_ablation,
             }
             extra_kwargs = {
                 "k_nearest": {"k_values": k_values, "n_runs": args.runs},
                 "threshold": {"tau_values": tau_values, "k_nearest": k_values[0] if k_values else 10, "n_runs": args.runs},
                 "mask_type": {"mask_types": mask_types, "k_nearest": k_values[0] if k_values else 10, "n_runs": args.runs},
                 "soft_mask": {"temperatures": temperatures, "k_nearest": k_values[0] if k_values else 10, "n_runs": args.runs},
+                "covis_mode": {"k_nearest": k_values[0] if k_values else 10, "n_runs": args.runs},
             }
 
             run_multi_sequence_ablation(
@@ -938,6 +1170,17 @@ def main():
             image_dir, temperatures=temperatures,
             max_images=max_images, n_runs=args.runs,
             output_file=args.output, sequence_dir=sequence_dir,
+        )
+    elif args.ablation == "covis_mode":
+        run_covis_mode_ablation(
+            image_dir, k_nearest=k_values[0] if k_values else 10,
+            max_images=max_images, n_runs=args.runs,
+            output_file=args.output, sequence_dir=sequence_dir,
+        )
+    elif args.ablation == "layer_entropy":
+        run_layer_entropy_analysis(
+            image_dir, max_images=max_images,
+            output_file=args.output,
         )
 
     # Cleanup temp dir if using CO3D

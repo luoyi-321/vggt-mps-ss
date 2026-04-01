@@ -24,8 +24,13 @@ from vggt_mps.megaloc_mps import MegaLocMPS
 
 class SparseAttentionAggregator(nn.Module):
     """
-    Drop-in replacement for VGGT's Aggregator with sparse attention
+    Drop-in replacement for VGGT's Aggregator with sparse attention.
     No retraining needed - uses existing weights!
+
+    Covisibility modes (set via covis_mode):
+      'visual'   — DINOv2 / pixel feature similarity (default)
+      'adaptive' — per-frame adaptive-k based on isolation score
+      'pose'     — geometric frustum overlap from predicted camera poses
     """
 
     def __init__(
@@ -35,7 +40,9 @@ class SparseAttentionAggregator(nn.Module):
         k_nearest: int = 10,
         threshold: float = 0.7,
         soft_mask: bool = False,
-        temperature: float = 0.1
+        temperature: float = 0.1,
+        sparse_layers: Optional[list] = None,
+        covis_mode: str = 'visual',   # 'visual' | 'adaptive' | 'pose'
     ):
         super().__init__()
         self.aggregator = original_aggregator
@@ -45,166 +52,184 @@ class SparseAttentionAggregator(nn.Module):
         self.soft_mask = soft_mask
         self.temperature = temperature
         self.attention_mask = None
+        self.covis_mode = covis_mode
+        # Which global_block indices receive the sparse mask.
+        # None = all layers (original behaviour).
+        # Per "Faster VGGT" (RWTH, 2509.07120) and our own entropy analysis:
+        # middle layers carry most cross-view information.
+        self.sparse_layers = sparse_layers
 
-    def set_covisibility_mask(self, images: torch.Tensor):
-        """Precompute covisibility mask for current batch"""
+    def set_covisibility_mask(
+        self,
+        images: torch.Tensor,
+        extrinsics: Optional[torch.Tensor] = None,
+    ):
+        """
+        Precompute covisibility mask for current batch.
+
+        Args:
+            images: [S, C, H, W] or [B, S, C, H, W]
+            extrinsics: [B, S, 4, 4] predicted camera poses for pose-guided mode.
+                        Required when covis_mode='pose'.
+        """
         with torch.no_grad():
             # Handle both [S, C, H, W] and [B, S, C, H, W] formats
             if images.ndim == 4:
-                # Single batch case [S, C, H, W]
                 images = images.unsqueeze(0)  # [1, S, C, H, W]
 
             B, S = images.shape[:2]
-            features = []
-            for b in range(B):
-                batch_features = []
-                for i in range(S):
-                    # Extract single image [C, H, W] and add batch dim
-                    single_image = images[b, i].unsqueeze(0)  # [1, C, H, W]
-                    feat = self.megaloc.extract_features(single_image)
-                    batch_features.append(feat.squeeze(0))  # Remove batch dim
-                features.append(torch.stack(batch_features))  # [S, D]
-            features = torch.stack(features)  # [B, S, D]
 
-            # Compute covisibility for each batch
+            # ── Feature extraction (always needed for visual/adaptive) ──
+            if self.covis_mode in ('visual', 'adaptive'):
+                features_list = []
+                for b in range(B):
+                    batch_features = []
+                    for i in range(S):
+                        single_image = images[b, i].unsqueeze(0)
+                        feat = self.megaloc.extract_features(single_image)
+                        batch_features.append(feat.squeeze(0))
+                    features_list.append(torch.stack(batch_features))  # [S, D]
+                features_batch = torch.stack(features_list)             # [B, S, D]
+            else:
+                features_batch = None
+
+            # ── Covisibility mask computation ──
             masks = []
             for b in range(B):
-                mask = self.megaloc.compute_covisibility_matrix(
-                    features[b],
-                    threshold=self.threshold,
-                    k_nearest=self.k_nearest,  # Each image attends to k nearest
-                    soft=self.soft_mask,
-                    temperature=self.temperature
-                )
+                if self.covis_mode == 'adaptive':
+                    # Novel: per-frame k allocation based on isolation score
+                    from vggt_mps.adaptive_covisibility import build_adaptive_covisibility_mask
+                    mask, _ = build_adaptive_covisibility_mask(
+                        features_batch[b],
+                        k_base=self.k_nearest,
+                        k_min=1,
+                        threshold=self.threshold,
+                    )
+                elif self.covis_mode == 'pose' and extrinsics is not None:
+                    # Novel: geometric frustum overlap from camera poses
+                    from vggt_mps.adaptive_covisibility import pose_guided_covisibility
+                    mask = pose_guided_covisibility(
+                        extrinsics[b],
+                        k=self.k_nearest,
+                    )
+                else:
+                    # Default: visual similarity (original method)
+                    mask = self.megaloc.compute_covisibility_matrix(
+                        features_batch[b],
+                        threshold=self.threshold,
+                        k_nearest=self.k_nearest,
+                        soft=self.soft_mask,
+                        temperature=self.temperature,
+                    )
                 masks.append(mask)
 
             self.attention_mask = torch.stack(masks)  # [B, S, S]
 
     def forward(self, x):
-        """Forward with sparse attention - patches the attention computation"""
-        # Store original attention function
-        original_attention = self.aggregator.attention if hasattr(self.aggregator, 'attention') else None
+        """Forward with sparse attention applied to VGGT's global_blocks."""
+        if self.attention_mask is None:
+            return self.aggregator(x)
 
-        # Choose attention implementation based on sparsity and availability
-        use_efficient = self.attention_mask is not None and self.k_nearest < self.attention_mask.shape[-1] // 2
+        # VGGT aggregator has:
+        #   - frame_blocks: per-frame self-attention [B*S, P, C] — no inter-frame interaction, skip masking
+        #   - global_blocks: cross-frame attention [B, S*P, C] — THIS is where covisibility mask applies
 
-        if use_efficient:
-            # Efficient gather-based sparse attention - O(n*k) instead of O(n²)
-            def sparse_attention(query, key, value):
-                return self._efficient_sparse_attention(query, key, value)
-        else:
-            # Fallback: mask-based attention (still O(n²) compute but correct output)
-            def sparse_attention(query, key, value):
-                return self._masked_attention(query, key, value)
+        # Patch each global_block.attn.forward to inject the covisibility mask.
+        # Per "Faster VGGT" (RWTH, 2509.07120): only middle layers 10-18 of 24
+        # carry significant cross-view info; early/late layers should stay dense.
+        # Use self.sparse_layers to control which blocks get the sparse kernel.
+        original_forwards = {}
+        S = self.attention_mask.shape[1]  # number of frames
 
-        # Temporarily replace attention
-        if hasattr(self.aggregator, 'attention'):
-            self.aggregator.attention = sparse_attention
+        if hasattr(self.aggregator, 'global_blocks'):
+            for idx, block in enumerate(self.aggregator.global_blocks):
+                # Skip layers not in the sparse set (keep them dense)
+                if self.sparse_layers is not None and idx not in self.sparse_layers:
+                    continue
+                if hasattr(block, 'attn'):
+                    original_forwards[idx] = block.attn.forward
+                    block.attn.forward = self._make_sparse_attn_forward(
+                        block.attn, self.attention_mask, S
+                    )
 
-        # Run original forward
+        # Run original forward (will use patched global_block.attn.forward)
         output = self.aggregator(x)
 
-        # Restore original attention
-        if original_attention is not None:
-            self.aggregator.attention = original_attention
+        # Restore original forwards
+        if hasattr(self.aggregator, 'global_blocks'):
+            for idx, block in enumerate(self.aggregator.global_blocks):
+                if idx in original_forwards and hasattr(block, 'attn'):
+                    block.attn.forward = original_forwards[idx]
 
         return output
 
-    def _masked_attention(self, query, key, value):
-        """Standard attention with mask applied (O(n²) - fallback)"""
-        scores = torch.matmul(query, key.transpose(-2, -1))
-        scores = scores / (key.shape[-1] ** 0.5)
-
-        if self.attention_mask is not None:
-            mask = self.attention_mask.unsqueeze(1)  # Add head dimension
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        attn_weights = F.softmax(scores, dim=-1)
-        output = torch.matmul(attn_weights, value)
-        return output
-
-    def _efficient_sparse_attention(self, query, key, value):
+    def _make_sparse_attn_forward(self, attn_module, attn_mask, S):
         """
-        Efficient gather-based sparse attention - reduces compute complexity.
+        Creates a patched forward for Attention using chunked per-frame sparse attention.
 
-        Complexity Analysis:
-        - Dense attention: O(N² * D) for matmul, O(N²) memory for scores
-        - This sparse: O(N * k * D) for gather + einsum, O(N * k) memory for scores
+        Previous approach: expand frame mask [B,S,S] → token mask [B,S*P,S*P].
+        Problem: for S=32, P=1374 this is a 43968×43968 matrix (~7.7 GB) — OOM.
 
-        Theoretical speedup: N/k (e.g., 10x for N=100, k=10)
+        New approach (chunked):
+          For each query frame i, gather only the k covisible frames' tokens as
+          keys/values, then run a small SDPA of shape [B,H,P,D] × [B,H,k*P,D].
 
-        IMPORTANT LIMITATION:
-        PyTorch's standard operations still require some memory overhead for gathering.
-        For maximum efficiency on large N, consider:
-        - FlashAttention (CUDA only, not MPS)
-        - xFormers block-sparse attention
-        - Custom MPS/Metal kernels
+        Complexity:
+          Dense:  O(S² × P²) — e.g. 43968² ≈ 1.93 B ops
+          Sparse: O(S × k × P²) — e.g. 32 × 4 × 1374² ≈ 241 M ops  (~8x less)
 
-        This implementation provides compute savings but has memory overhead from
-        the gather operation. It's most beneficial when N is large and k << N.
+        Memory: no N×N matrix materialised; peak is O(k×P²) per frame step.
         """
-        B, H, N, D = query.shape  # [batch, heads, seq_len, head_dim]
-        k = min(self.k_nearest, N)
+        def sparse_forward(x, pos=None):
+            B, N, C = x.shape
+            P = N // S  # patches per frame
+            device = x.device
 
-        # Get indices of k-nearest neighbors from attention mask
-        if self.attention_mask is not None:
-            # topk returns (values, indices), we need indices
-            _, topk_indices = torch.topk(self.attention_mask, k=k, dim=-1)  # [B, N, k]
-        else:
-            # Fallback: local sliding window attention
-            indices = torch.arange(N, device=query.device)
-            offsets = torch.arange(-(k//2), k - k//2, device=query.device)
-            neighbor_idx = (indices.unsqueeze(1) + offsets.unsqueeze(0)).clamp(0, N-1)
-            topk_indices = neighbor_idx.unsqueeze(0).expand(B, -1, -1)
+            # --- QKV projection ---
+            qkv = attn_module.qkv(x).reshape(
+                B, N, 3, attn_module.num_heads, attn_module.head_dim
+            ).permute(2, 0, 3, 1, 4)          # [3, B, H, N, D]
+            q, k, v = qkv.unbind(0)            # each [B, H, N, D]
+            q = attn_module.q_norm(q)
+            k = attn_module.k_norm(k)
 
-        # === GATHER KEY/VALUE FOR K NEIGHBORS ===
-        # Strategy: Use embedding-style lookup to avoid O(N²) memory
-        # key, value: [B, H, N, D]
-        # topk_indices: [B, N, k]
+            if attn_module.rope is not None and pos is not None:
+                q = attn_module.rope(q, pos)
+                k = attn_module.rope(k, pos)
 
-        # Reshape for efficient gathering: [B, H, N, D] -> [B, N, H*D]
-        key_flat = key.permute(0, 2, 1, 3).reshape(B, N, H * D)  # [B, N, H*D]
-        value_flat = value.permute(0, 2, 1, 3).reshape(B, N, H * D)  # [B, N, H*D]
+            # --- Chunked sparse attention over frames ---
+            # Process each query frame independently, attending only to its
+            # covisible peer frames (determined by attn_mask [B, S, S]).
+            # Use batch 0 mask; for B>1 all items share the same covisibility.
+            mask_b = attn_mask[0]              # [S, S], 1=attend 0=block
 
-        # Expand indices for gathering: [B, N, k] -> [B, N, k, H*D]
-        idx_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, H * D)  # [B, N, k, H*D]
+            out = torch.zeros_like(q)          # [B, H, N, D]
+            arange_P = torch.arange(P, device=device)
 
-        # Gather: O(B * N * k * H * D) operations, not O(N²)
-        # This selects k vectors of size H*D for each of the N query positions
-        gathered_keys_flat = torch.gather(
-            key_flat.unsqueeze(2).expand(-1, -1, k, -1),  # [B, N, k, H*D] broadcast view
-            dim=1,  # Gather along the N dimension
-            index=idx_expanded
-        )  # [B, N, k, H*D]
+            for i in range(S):
+                covis = (mask_b[i] > 0).nonzero(as_tuple=True)[0]  # [k_i]
+                if covis.numel() == 0:
+                    continue
 
-        gathered_values_flat = torch.gather(
-            value_flat.unsqueeze(2).expand(-1, -1, k, -1),
-            dim=1,
-            index=idx_expanded
-        )
+                # Token indices for all patches of covisible frames
+                token_idx = (covis.unsqueeze(1) * P + arange_P).flatten()  # [k_i*P]
 
-        # Reshape back: [B, N, k, H*D] -> [B, H, N, k, D]
-        gathered_keys = gathered_keys_flat.reshape(B, N, k, H, D).permute(0, 3, 1, 2, 4)
-        gathered_values = gathered_values_flat.reshape(B, N, k, H, D).permute(0, 3, 1, 2, 4)
+                q_i = q[:, :, i * P: (i + 1) * P, :]   # [B, H, P, D]
+                k_c = k[:, :, token_idx, :]              # [B, H, k_i*P, D]
+                v_c = v[:, :, token_idx, :]              # [B, H, k_i*P, D]
 
-        # === COMPUTE SPARSE ATTENTION ===
-        # scores: [B, H, N, k] - only k scores per query, not N
-        scores = torch.einsum('bhnd,bhnkd->bhnk', query, gathered_keys)
-        scores = scores / (D ** 0.5)
+                out_i = F.scaled_dot_product_attention(
+                    q_i, k_c, v_c,
+                    dropout_p=attn_module.attn_drop.p if attn_module.training else 0.0
+                )                                        # [B, H, P, D]
+                out[:, :, i * P: (i + 1) * P, :] = out_i
 
-        # Apply soft mask weights if enabled
-        if self.soft_mask and self.attention_mask is not None:
-            mask_gathered = torch.gather(self.attention_mask, dim=2, index=topk_indices)
-            mask_gathered = mask_gathered.unsqueeze(1).expand(-1, H, -1, -1)
-            scores = scores + torch.log(mask_gathered.clamp(min=1e-8))
+            out = out.transpose(1, 2).reshape(B, N, C)
+            out = attn_module.proj(out)
+            out = attn_module.proj_drop(out)
+            return out
 
-        # Softmax over k neighbors (not N) - this is where we save compute
-        attn_weights = F.softmax(scores, dim=-1)  # [B, H, N, k]
-
-        # Weighted sum: O(B * H * N * k * D) instead of O(B * H * N * N * D)
-        output = torch.einsum('bhnk,bhnkd->bhnd', attn_weights, gathered_values)
-
-        return output
+        return sparse_forward
 
 
 def make_vggt_sparse(
@@ -215,42 +240,50 @@ def make_vggt_sparse(
     megaloc: Optional[MegaLocMPS] = None,
     lightweight: bool = True,
     soft_mask: bool = False,
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    sparse_layers: Optional[list] = None,
+    all_layers: bool = False,
 ) -> nn.Module:
     """
     Convert regular VGGT to sparse attention version.
     NO RETRAINING REQUIRED - uses existing weights!
 
-    Complexity Improvements:
-    - Dense attention: O(N²) compute, O(N²) memory for attention matrix
-    - Sparse attention: O(N*k) compute for attention, O(N*k) memory for scores
+    Uses chunked per-frame sparse attention: for each query frame i, only
+    the k covisible frames' patches are used as keys/values.
 
-    When k=10 and N=100: ~10x compute reduction for attention operations
-    When k=10 and N=500: ~50x compute reduction
+    Complexity (chunked approach):
+    - Dense:  O(S² × P²)   — e.g. S=32, P=1374 → 1.93 B ops, ~7.7 GB mask
+    - Sparse: O(S × k × P²) — e.g. k=4 → 241 M ops, no large mask (8× less)
 
-    Limitations (PyTorch on MPS):
-    - Gathering keys/values still has some memory overhead
-    - Best speedup when N >> k (e.g., N > 50, k < 15)
-    - For maximum efficiency, would need custom Metal/CUDA kernels
+    Layer selectivity (per Faster VGGT, RWTH 2509.07120):
+    - VGGT has 24 global_blocks; middle layers 10-18 carry most cross-view info
+    - Default: apply sparse kernel only to layers 10-18 (keeps first/last dense)
+    - Set all_layers=True to apply to every layer
 
     Args:
         vggt_model: Pretrained VGGT model
         device: Device to use (mps/cuda/cpu)
-        k_nearest: Number of nearest neighbors for sparse attention (default: 10)
-                   Lower k = more sparse = faster but may lose quality
+        k_nearest: Number of nearest neighbors per frame (default: 10)
         threshold: Covisibility threshold for feature similarity (default: 0.7)
-        megaloc: Optional pre-constructed MegaLocMPS instance (avoids reloading DINOv2)
+        megaloc: Optional pre-constructed MegaLocMPS instance
         lightweight: If True, skip DINOv2 to save memory (default: True for MPS)
-        soft_mask: If True, use soft probabilistic masks instead of hard binary masks.
-                   Soft masks provide smoother gradient flow at decision boundaries.
-        temperature: Temperature for soft mask sigmoid (default: 0.1).
-                     Lower values approach hard mask behavior.
+        soft_mask: If True, use soft probabilistic masks
+        temperature: Temperature for soft mask sigmoid (default: 0.1)
+        sparse_layers: Explicit list of global_block indices to sparsify.
+                       None = use default middle-layer selection.
+        all_layers: If True, apply sparse attention to all global_blocks
+                    (overrides sparse_layers default).
 
     Returns:
         VGGT model with sparse attention
     """
 
-    print(f"🔧 Converting VGGT to sparse attention (k={k_nearest}, τ={threshold}, soft={soft_mask}, T={temperature}, lightweight={lightweight})...")
+    # Default to middle layers per Faster VGGT finding
+    if sparse_layers is None and not all_layers:
+        sparse_layers = list(range(10, 19))  # layers 10..18 of 24
+
+    print(f"Converting VGGT to sparse attention (k={k_nearest}, tau={threshold}, "
+          f"sparse_layers={'all' if all_layers else sparse_layers})...")
 
     # Reuse provided MegaLocMPS or build a new one
     if megaloc is None:
@@ -264,7 +297,8 @@ def make_vggt_sparse(
         k_nearest=k_nearest,
         threshold=threshold,
         soft_mask=soft_mask,
-        temperature=temperature
+        temperature=temperature,
+        sparse_layers=None if all_layers else sparse_layers,
     )
 
     # Monkey-patch the model
@@ -283,11 +317,10 @@ def make_vggt_sparse(
 
     vggt_model.forward = forward_with_mask
 
-    print("✅ VGGT converted to sparse attention!")
-    print(f"   - Attention compute: O(n*{k_nearest}) instead of O(n²)")
-    print(f"   - Score memory: O(n*{k_nearest}) instead of O(n²)")
-    print(f"   - Theoretical speedup: n/{k_nearest}x for attention ops")
-    print("   - No retraining needed - uses existing weights")
+    print("VGGT converted to sparse attention (chunked per-frame kernel)!")
+    print(f"   Sparse kernel: O(S x k x P^2) vs dense O(S^2 x P^2), ~S/k speedup")
+    print(f"   k_nearest={k_nearest}, sparse_layers={'all' if all_layers else sparse_layers}")
+    print("   No retraining needed - uses existing weights")
 
     return vggt_model
 

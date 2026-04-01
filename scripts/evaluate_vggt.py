@@ -325,7 +325,15 @@ def evaluate_chunked(
     }
 
 
-def load_model(device: torch.device, mode: str = "dense", k_nearest: int = 10, threshold: float = 0.7):
+def load_model(
+    device: torch.device,
+    mode: str = "dense",
+    k_nearest: int = 10,
+    threshold: float = 0.7,
+    use_bfloat16: bool = False,
+    sparse_layers: Optional[list] = None,
+    all_layers: bool = False,
+):
     """
     Load VGGT model in dense or sparse mode.
 
@@ -334,6 +342,11 @@ def load_model(device: torch.device, mode: str = "dense", k_nearest: int = 10, t
         mode: "dense" or "sparse"
         k_nearest: Number of nearest neighbors for sparse mode
         threshold: Covisibility threshold for sparse mode
+        use_bfloat16: Cast model to bfloat16 (VGGT-X technique: ~74% VRAM reduction).
+                      Prediction heads stay in float32 for numerical accuracy.
+        sparse_layers: Specific global_block indices to sparsify.
+                       None = default middle-layer selection [10..18].
+        all_layers: Apply sparse attention to all global_blocks.
 
     Returns:
         Loaded VGGT model
@@ -352,6 +365,16 @@ def load_model(device: torch.device, mode: str = "dense", k_nearest: int = 10, t
         print("Download from: https://huggingface.co/facebook/VGGT-1B")
         sys.exit(1)
 
+    # Override flags from environment (set by run_ablations.py CLI)
+    import os as _os
+    if _os.environ.get("VGGT_BFLOAT16") == "1":
+        use_bfloat16 = True
+    if _os.environ.get("VGGT_ALL_LAYERS") == "1":
+        all_layers = True
+    _env_layers = _os.environ.get("VGGT_SPARSE_LAYERS")
+    if _env_layers and sparse_layers is None:
+        sparse_layers = [int(x) for x in _env_layers.split(",")]
+
     print(f"Loading model from {model_path}...")
     model = VGGT()
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
@@ -359,12 +382,31 @@ def load_model(device: torch.device, mode: str = "dense", k_nearest: int = 10, t
     model = model.to(device)
     model.eval()
 
+    # BFloat16 (VGGT-X paper: 74% VRAM reduction, minimal quality loss)
+    # Keep prediction heads in float32 for numerical stability.
+    if use_bfloat16 and device.type in ("cuda", "mps"):
+        print("Converting to BFloat16 (VGGT-X technique)...")
+        model = model.to(torch.bfloat16)
+        # Restore float32 for output heads
+        head_names = ["depth_head", "camera_head", "track_head", "pts3d_head"]
+        for name in head_names:
+            head = getattr(model, name, None)
+            if head is not None:
+                head.to(torch.float32)
+
     # Convert to sparse if requested
     if mode == "sparse":
         try:
             from vggt_mps.vggt_sparse_attention import make_vggt_sparse
-            # Use lightweight=True to skip DINOv2 and save memory on MPS
-            model = make_vggt_sparse(model, device=str(device), k_nearest=k_nearest, threshold=threshold, lightweight=True)
+            model = make_vggt_sparse(
+                model,
+                device=str(device),
+                k_nearest=k_nearest,
+                threshold=threshold,
+                lightweight=True,
+                sparse_layers=sparse_layers,
+                all_layers=all_layers,
+            )
         except ImportError as e:
             print(f"Warning: Could not import sparse attention module: {e}")
             print("Falling back to dense mode.")
