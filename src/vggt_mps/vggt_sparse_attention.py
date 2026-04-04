@@ -165,29 +165,66 @@ class SparseAttentionAggregator(nn.Module):
 
     def _make_sparse_attn_forward(self, attn_module, attn_mask, S):
         """
-        Creates a patched forward for Attention using chunked per-frame sparse attention.
+        Batched per-frame sparse attention — single SDPA kernel launch.
 
-        Previous approach: expand frame mask [B,S,S] → token mask [B,S*P,S*P].
-        Problem: for S=32, P=1374 this is a 43968×43968 matrix (~7.7 GB) — OOM.
+        Root cause of old slowdown: Python for-loop over S frames → S separate
+        SDPA kernel launches (e.g. S=64 → 1,536 launches vs 24 for dense).
 
-        New approach (chunked):
-          For each query frame i, gather only the k covisible frames' tokens as
-          keys/values, then run a small SDPA of shape [B,H,P,D] × [B,H,k*P,D].
+        Fix: precompute a gather index tensor [S, max_k*P], do ONE tensor.index_select
+        to gather all K/V for all frames, reshape to [B*S, H, max_k*P, D], then call
+        F.scaled_dot_product_attention ONCE on the full batch.
 
-        Complexity:
-          Dense:  O(S² × P²) — e.g. 43968² ≈ 1.93 B ops
-          Sparse: O(S × k × P²) — e.g. 32 × 4 × 1374² ≈ 241 M ops  (~8x less)
-
-        Memory: no N×N matrix materialised; peak is O(k×P²) per frame step.
+        Complexity (unchanged from chunked approach):
+          FLOPs:  O(S × k × P²)   vs dense O(S² × P²)  → S/k× reduction
+          Memory: O(S × k × P)    vs dense O(S² × P²)   → no large attn matrix
+          Kernel launches: 1       vs old S launches      → eliminates dispatch overhead
         """
+        # Index cache: keyed by P to avoid recomputing when P is constant.
+        _idx_cache: dict = {}
+
+        def _build_gather_index(mask_b: torch.Tensor, P: int, device: torch.device):
+            """
+            Build [S, max_k*P] gather index and optional padding bias.
+            Computed once per (mask, P) pair and cached.
+            """
+            arange_P = torch.arange(P, device=device)
+            covis_list = [(mask_b[i] > 0).nonzero(as_tuple=True)[0] for i in range(S)]
+            k_sizes   = [int(c.numel()) for c in covis_list]
+            max_k     = max(k_sizes)
+
+            gather_idx = torch.zeros(S, max_k * P, dtype=torch.long, device=device)
+            has_pad    = False
+
+            for i in range(S):
+                covis  = covis_list[i]
+                k_i    = k_sizes[i]
+                tok    = (covis.unsqueeze(1) * P + arange_P).flatten()   # [k_i*P]
+                gather_idx[i, :k_i * P] = tok
+                if k_i < max_k:
+                    gather_idx[i, k_i * P:] = tok[0]   # pad with valid index
+                    has_pad = True
+
+            # attn_bias shape [S, 1, 1, max_k*P] — broadcast over [B*S, H, P, max_k*P]
+            attn_bias = None
+            if has_pad:
+                attn_bias = torch.zeros(S, 1, 1, max_k * P, device=device)
+                for i in range(S):
+                    k_i = k_sizes[i]
+                    if k_i < max_k:
+                        attn_bias[i, 0, 0, k_i * P:] = float('-inf')
+
+            return gather_idx, attn_bias, max_k
+
         def sparse_forward(x, pos=None):
             B, N, C = x.shape
-            P = N // S  # patches per frame
-            device = x.device
+            P       = N // S
+            H       = attn_module.num_heads
+            D       = attn_module.head_dim
+            device  = x.device
 
-            # --- QKV projection ---
+            # ── QKV projection (1 fused linear layer) ─────────────────────
             qkv = attn_module.qkv(x).reshape(
-                B, N, 3, attn_module.num_heads, attn_module.head_dim
+                B, N, 3, H, D
             ).permute(2, 0, 3, 1, 4)          # [3, B, H, N, D]
             q, k, v = qkv.unbind(0)            # each [B, H, N, D]
             q = attn_module.q_norm(q)
@@ -197,34 +234,44 @@ class SparseAttentionAggregator(nn.Module):
                 q = attn_module.rope(q, pos)
                 k = attn_module.rope(k, pos)
 
-            # --- Chunked sparse attention over frames ---
-            # Process each query frame independently, attending only to its
-            # covisible peer frames (determined by attn_mask [B, S, S]).
-            # Use batch 0 mask; for B>1 all items share the same covisibility.
-            mask_b = attn_mask[0]              # [S, S], 1=attend 0=block
+            # ── Build / retrieve gather index (cached after first call) ───
+            mask_b = attn_mask[0]              # [S, S]
+            if P not in _idx_cache:
+                _idx_cache[P] = _build_gather_index(mask_b, P, device)
+            gather_idx, attn_bias, max_k = _idx_cache[P]
 
-            out = torch.zeros_like(q)          # [B, H, N, D]
-            arange_P = torch.arange(P, device=device)
+            # ── Single gather for ALL frames at once ──────────────────────
+            # gather_idx : [S, max_k*P]
+            # k, v       : [B, H, N, D]
+            flat_idx  = gather_idx.reshape(-1)              # [S*max_k*P]
+            k_flat    = k[:, :, flat_idx, :]                # [B, H, S*max_k*P, D]
+            v_flat    = v[:, :, flat_idx, :]                # [B, H, S*max_k*P, D]
 
-            for i in range(S):
-                covis = (mask_b[i] > 0).nonzero(as_tuple=True)[0]  # [k_i]
-                if covis.numel() == 0:
-                    continue
+            # Reshape to [B, H, S, max_k*P, D] → permute → [B*S, H, max_k*P, D]
+            k_batched = k_flat.reshape(B, H, S, max_k * P, D).permute(0, 2, 1, 3, 4).reshape(B * S, H, max_k * P, D)
+            v_batched = v_flat.reshape(B, H, S, max_k * P, D).permute(0, 2, 1, 3, 4).reshape(B * S, H, max_k * P, D)
 
-                # Token indices for all patches of covisible frames
-                token_idx = (covis.unsqueeze(1) * P + arange_P).flatten()  # [k_i*P]
+            # Queries: [B, H, S*P, D] → [B, H, S, P, D] → [B*S, H, P, D]
+            q_batched = q.reshape(B, H, S, P, D).permute(0, 2, 1, 3, 4).reshape(B * S, H, P, D)
 
-                q_i = q[:, :, i * P: (i + 1) * P, :]   # [B, H, P, D]
-                k_c = k[:, :, token_idx, :]              # [B, H, k_i*P, D]
-                v_c = v[:, :, token_idx, :]              # [B, H, k_i*P, D]
+            # Padding bias: [S, 1, 1, max_k*P] → [B*S, 1, 1, max_k*P]
+            bias_arg = None
+            if attn_bias is not None:
+                bias_arg = attn_bias.expand(B, S, 1, max_k * P).reshape(B * S, 1, 1, max_k * P)
 
-                out_i = F.scaled_dot_product_attention(
-                    q_i, k_c, v_c,
-                    dropout_p=attn_module.attn_drop.p if attn_module.training else 0.0
-                )                                        # [B, H, P, D]
-                out[:, :, i * P: (i + 1) * P, :] = out_i
+            # ── ONE batched SDPA call (single CUDA kernel launch) ─────────
+            out = F.scaled_dot_product_attention(
+                q_batched,              # [B*S, H, P, D]
+                k_batched,              # [B*S, H, max_k*P, D]
+                v_batched,              # [B*S, H, max_k*P, D]
+                attn_mask=bias_arg,
+                dropout_p=attn_module.attn_drop.p if attn_module.training else 0.0,
+            )                           # [B*S, H, P, D]
 
+            # ── Reshape back to [B, N, C] ─────────────────────────────────
+            out = out.reshape(B, S, H, P, D).permute(0, 2, 1, 3, 4).reshape(B, H, N, D)
             out = out.transpose(1, 2).reshape(B, N, C)
+
             out = attn_module.proj(out)
             out = attn_module.proj_drop(out)
             return out
