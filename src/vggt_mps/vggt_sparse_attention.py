@@ -255,9 +255,10 @@ class SparseAttentionAggregator(nn.Module):
             q_batched = q.reshape(B, H, S, P, D).permute(0, 2, 1, 3, 4).reshape(B * S, H, P, D)
 
             # Padding bias: [S, 1, 1, max_k*P] → [B*S, 1, 1, max_k*P]
+            # Must unsqueeze(0) first to insert batch dim before expand
             bias_arg = None
             if attn_bias is not None:
-                bias_arg = attn_bias.expand(B, S, 1, max_k * P).reshape(B * S, 1, 1, max_k * P)
+                bias_arg = attn_bias.unsqueeze(0).expand(B, S, 1, max_k * P).reshape(B * S, 1, 1, max_k * P)
 
             # ── ONE batched SDPA call (single CUDA kernel launch) ─────────
             out = F.scaled_dot_product_attention(
